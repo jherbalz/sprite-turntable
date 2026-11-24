@@ -1,0 +1,8 @@
+{
+  "_comment": "32 angles around the model - smooth turning.",
+  "angles": 32,
+  "res": 512,
+  "px-per-m": 307,
+  "ground-px": 82,
+  "elev": 6
+}

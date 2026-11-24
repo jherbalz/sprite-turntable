@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Blender
+*.blend1
+
+# Output
+out/
+sheet/
+*.png
+*.jpg
+
+# Editors
+.idea/
+.vscode/
+.DS_Store

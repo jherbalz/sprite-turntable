@@ -1,0 +1,8 @@
+{
+  "_comment": "16 angles around the model - the quick look.",
+  "angles": 16,
+  "res": 512,
+  "px-per-m": 307,
+  "ground-px": 82,
+  "elev": 6
+}
