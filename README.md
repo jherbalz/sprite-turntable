@@ -8,6 +8,12 @@ subscription and no network calls.
 
 Get the code: <https://github.com/jherbalz/sprite-turntable>
 
+**Where this came from:** this is the same renderer that ships inside
+Blaster Master, cleaned of the game-specific code and given to everybody.
+The scale contract, the flat-albedo look and the angle grid are the ones
+the game already uses, so a sheet made here drops straight into a project
+that uses them.
+
 ---
 
 ## What it makes
@@ -112,8 +118,12 @@ fine:
 | `--elev` | camera tilt in degrees (default 6) |
 | `--anchor` | `floor` (feet on the ground line) or `center` |
 | `--length` | rescale the model to this length in metres |
-| `--action` | the animation action to pose a rig with |
-| `--frames` | frame or frames of that action, e.g. `1,8,16` |
+| `--action` | the animation to pose the rig with, or `all` for every animation in the model |
+| `--frames` | frames of that animation, e.g. `1,8,16`, or `all` for the whole cycle |
+| `--list-actions` | print the animations the model has, then stop |
+| `--batch` | a JSON job list: one sheet per model and animation |
+| `--fps` | frames per second written into the manifest (default 12) |
+| `--manifest` | where the manifest is written (default: in the output folder) |
 | `--compress` | rescale the action's keyframes into this many frames |
 | `--in-place` | pin the rig's root so a walk cycle stays in frame |
 | `--spin` | render a spin sheet of N frames instead of an angle sheet |
@@ -135,6 +145,99 @@ game can play back over the turning model.
 Blender 4.4 and later use slotted actions, and this script binds the slot
 as well as the action. If a rig comes out frozen in its rest pose, that is
 the reason, and it is handled here.
+
+## Which animation plays
+
+This is the part that turns a spinning model into a character. A rigged
+model carries its clips - walk, aim, fire - and each one can be shot as
+its own sheet.
+
+**Ask the model what it has:**
+
+    sprite_turntable.bat --model hero.glb --list-actions
+
+It prints every clip in the file, the frame range and how many bones it
+drives:
+
+    11_Sentinel_Rig_Walk   frames 0-24    bones 5
+    11_Sentinel_Rig_Aim    frames 0-24    bones 1
+
+**Shoot one clip:**
+
+    sprite_turntable.bat --model hero.glb --out .\sheet --action Walk --frames all
+
+`--frames all` takes the whole cycle, resampled into `--compress` frames
+(8 by default). `--frames 1,8,16` takes the frames you name instead.
+
+**Shoot every clip at once:**
+
+    sprite_turntable.bat --model hero.glb --out .\sheet --action all --frames all
+
+Each animation lands in its own folder:
+
+    sheet\walk\sheet_a00_f00.png
+    sheet\aim\sheet_a00_f00.png
+    sheet\fire\sheet_a00_f00.png
+
+One folder per character, one folder per animation inside it. That is the
+layout a game reads: `walk`, `aim`, `fire`, `die`.
+
+## Wiring it to Godot
+
+The frames are a grid: one row per angle, each row is the animation
+frames. `sprite_manifest.json` is written next to them and says so:
+
+    {
+      "angles": 64,
+      "fps": 12,
+      "actions": [
+        { "name": "11_Sentinel_Rig_Walk", "folder": "walk",
+          "angles": 64, "frames": 8,
+          "frame_numbers": [0, 3, 6, 9, 12, 15, 18, 21],
+          "pattern": "sheet_a%02d_f%02d.png" }
+      ]
+    }
+
+In Godot, load the frames of one animation as an array of arrays: rows
+are angles, and the inner array is the animation. Play the animation
+frames for the row of the angle you are facing. Blending the two
+nearest angles looks smooth, and at 64 angles the blend IS the true
+rotation, so the turn never snaps.
+
+## The player
+
+Every run writes `sprite_viewer.html` next to the frames. Open it and the
+sheet plays: the animation runs, the turntable turns, and you can pick
+the animation, the angle and the speed. It is one HTML file - no
+install, no server, works on any computer with a browser.
+
+| What it does | |
+|---|---|
+| The dropdown | every animation in the sheet |
+| The animation slider | step the animation frame by frame |
+| The turntable slider | turn the model to any angle |
+| SPIN | the model turns while the animation plays |
+| The strip at the bottom | the animation frames of the current angle |
+
+Space plays and pauses. Left and right step the animation. Up and down
+turn the model.
+
+## Shooting a whole cast
+
+One JSON file, one command. Each job is a model and an animation:
+
+    {
+      "jobs": [
+        { "name": "GUARDIAN", "model": "guards/guard.blend",
+          "action": "Walk", "frames": "1:7:13:19", "angles": 64 },
+        { "name": "GUARDIAN", "model": "guards/guard.blend",
+          "action": "Fire", "frames": "1:5" }
+      ]
+    }
+
+    sprite_turntable.bat --batch cast.json --out .\cast
+
+Every job lands in `cast\GUARDIAN\walk\` and `cast\GUARDIAN\fire\`.
 
 ## What it does not do
 
@@ -170,6 +273,9 @@ opened. Keep the textures next to the model, or pack them into the
 | file | what it is |
 |---|---|
 | `sprite_turntable.py` | the whole tool |
+| `sprite_turntable_gui.ps1` | the Windows window: one button |
+| `sprite_turntable_ui.py` | the same button inside Blender |
+| `sprite_viewer.html` | the player that comes with every sheet |
 | `sprite_turntable.bat` | double-click runner for Windows |
 | `sprite_turntable.sh` | runner for Mac and Linux |
 | `presets/` | ready-made setups for 16, 32 and 64 angles |

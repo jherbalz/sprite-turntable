@@ -59,7 +59,7 @@ except ImportError:  # running outside Blender: --help and the checks still work
     IN_BLENDER = False
 
 HERE = Path(__file__).resolve().parent
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 SHEET_RANGE = 8.0
 PX_PER_M = 307.0
@@ -119,10 +119,25 @@ def build_parser(defaults=None):
                    help="rescale the model to this length in metres "
                         "(0 keeps the model's own size)")
     p.add_argument("--action", default="",
-                   help="the animation action to pose the rig with")
+                   help="the animation action to pose the rig with. "
+                        "'all' shoots every action the model has")
     p.add_argument("--frames", "--frame", dest="frames", default="1",
                    help="frame or frames of that action, comma or colon "
-                        "separated (default: 1)")
+                        "separated, or 'all' for the whole cycle "
+                        "(default: 1)")
+    p.add_argument("--list-actions", dest="list_actions", action="store_true",
+                   help="print the animations the model has, then stop")
+    p.add_argument("--batch", default="",
+                   help="a JSON job list: one sheet per model and action")
+    p.add_argument("--fps", type=int, default=12,
+                   help="frames per second recorded in the manifest "
+                        "(default: %(default)s)")
+    p.add_argument('--fit', action='store_true',
+                   help='pull the camera back so the whole model fits '
+                        'in the frame (a tall model is cut off otherwise)')
+    p.add_argument('--manifest', default='',
+                   help="where the manifest is written (default: "
+                        "sprite_manifest.json in the output folder)")
     p.add_argument("--compress", type=float, default=8.0,
                    help="rescale the action's keyframes into this many "
                         "frames (default: %(default)s)")
@@ -291,6 +306,26 @@ def action_fcurves(act):
     return fcs
 
 
+
+def action_range(act):
+    """The action's real frame range, measured off its keyframes.
+
+    act.frame_range comes back empty on some slotted actions, so the
+    range is read from the curves instead of trusting the property.
+    """
+    lo = hi = None
+    for fc in action_fcurves(act):
+        for kp in fc.keyframe_points:
+            x = float(kp.co[0])
+            if lo is None or x < lo:
+                lo = x
+            if hi is None or x > hi:
+                hi = x
+    if lo is None:
+        return (0.0, 0.0)
+    return (lo, hi)
+
+
 def pose_from_curves(arm, act, frame):
     """Set the pose by hand from the action's curves.
 
@@ -348,7 +383,7 @@ def make_sheet_action(act, new_range):
     a 32 frame cycle is rescaled into 8 frames for the sheet. The game only
     ever needs the loop, not the original timing.
     """
-    src_start, src_end = act.frame_range[0], act.frame_range[1]
+    src_start, src_end = action_range(act)
     span = max(src_end - src_start, 0.001)
     new = act.copy()
     new.name = act.name + "_sheet"
@@ -366,28 +401,207 @@ def make_sheet_action(act, new_range):
 SHEET_ACTION = {}
 
 
+def quiet_rig(arm):
+    """Stop anything else from driving the rig.
+
+    A rig file can carry its clips as NLA tracks as well as an action.
+    Any frame change re-poses the bones from those tracks and throws
+    away a pose that was set by hand, so the tracks are muted first.
+    Without this the sheet renders the same pose on every frame.
+    """
+    ad = arm.animation_data
+    if ad is None:
+        return
+    ad.action = None
+    for track in ad.nla_tracks:
+        track.mute = True
+
+
 def set_pose(arm, action_name, frame):
     """Drive the rig to a named action at a given frame."""
-    for act in list(bpy.data.actions):
-        if action_name and action_name not in act.name:
+    acts = list(bpy.data.actions)
+    # An exact name wins. A partial name is still accepted, because the
+    # clips in a rig are often called Armature|Walk or Walk.001.
+    pick = None
+    for act in acts:
+        if act.name == action_name:
+            pick = act
+            break
+    if pick is None:
+        for act in acts:
+            if action_name and action_name in act.name:
+                pick = act
+                break
+    if pick is None:
+        return False
+    act = pick
+    if SHEET_RANGE > 0.0:
+        key = act.name
+        if key not in SHEET_ACTION:
+            SHEET_ACTION[key] = make_sheet_action(act, SHEET_RANGE)
+        sheet, src_start, span = SHEET_ACTION[key]
+        act = sheet
+        frame = int(round((frame - src_start) / span * SHEET_RANGE))
+    # The action is NEVER bound to the rig. On some of these rigs the
+    # action own evaluation collapses the skinned mesh to a point,
+    # so the pose is driven from the curves by hand instead and the
+    # scene stays on a frame where nothing is bound.
+    bpy.context.scene.frame_set(1)
+    quiet_rig(arm)
+    pose_from_curves(arm, act, frame)
+    bpy.context.view_layer.update()
+    return True
+
+
+def safe_name(text):
+    """A name that is safe as a folder name on every system."""
+    out = []
+    for ch in str(text):
+        out.append(ch if (ch.isalnum() or ch in '-_.') else '_')
+    return "".join(out).strip("._") or "action"
+
+
+def action_folder(act_name, arm):
+    """The folder an action lands in: walk, aim, fire.
+
+    Rig files name their clips after the rig, so 11_Sentinel_Rig_Walk
+    becomes walk. That is the layout a game reads: one folder per
+    animation, inside one folder per character.
+    """
+    name = str(act_name)
+    if arm is not None:
+        prefix = arm.name + "_"
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+        elif name.startswith(arm.name):
+            name = name[len(arm.name):]
+    return safe_name(name).lower()
+
+
+def action_info():
+    """Every action in the file: name, frame range, animated bones.
+
+    This is what the window shows, so the person can pick the animation
+    they actually want - walk, attack, whatever the model carries.
+    """
+    out = []
+    for act in bpy.data.actions:
+        fcs = action_fcurves(act)
+        bones = sorted({fc.data_path.split(chr(34))[1] for fc in fcs
+                        if fc.data_path.startswith('pose.bones[')
+                        and chr(34) in fc.data_path})
+        lo, hi = action_range(act)
+        out.append({
+            'name': act.name,
+            'start': round(lo, 3),
+            'end': round(hi, 3),
+            'frames': int(round(hi - lo)) + 1,
+            'bones': len(bones),
+        })
+    return out
+
+
+def frames_for(name, args, found):
+    """Which frames of an action are shot.
+
+    all is the whole cycle, resampled into --compress frames so the
+    sheet stays short. Anything else is the list that was asked for.
+    """
+    want = str(getattr(args, 'frames', '1') or '1').strip().lower()
+    if want in ('all', '*'):
+        info = None
+        for a in found:
+            if a['name'] == name:
+                info = a
+                break
+        if info is None:
+            return [1]
+        lo = int(info['start'])
+        hi = int(info['end'])
+        count = max(1, int(round(float(args.compress))))
+        span = max(hi - lo, 0)
+        if count == 1 or span == 0:
+            return [lo]
+        picked = []
+        for i in range(count):
+            f = lo + int(round(i * span / float(count - 1)))
+            if f not in picked:
+                picked.append(f)
+        return picked
+    picked = []
+    for x in want.replace(",", ":").split(":"):
+        x = x.strip()
+        if x:
+            picked.append(int(x))
+    return picked or [1]
+
+
+def run_batch(args):
+    """A JOB LIST: many models, one sheet each.
+
+    The job file is JSON: a list of name, model, action and frames.
+    Each job lands in out/name/action, which is the layout the Blaster
+    Master game already reads, so a whole roster is one command.
+    """
+    path = Path(args.batch)
+    if not path.is_file():
+        raise SystemExit('no such job list: ' + str(path))
+    data = json.loads(path.read_text(encoding='utf-8'))
+    jobs = data.get('jobs') if isinstance(data, dict) else data
+    if not isinstance(jobs, list):
+        raise SystemExit('the job list must be a list of jobs')
+    outroot = Path(args.out)
+    outroot.mkdir(parents=True, exist_ok=True)
+    done = 0
+    for job in jobs:
+        if not isinstance(job, dict):
             continue
-        if SHEET_RANGE > 0.0:
-            key = act.name
-            if key not in SHEET_ACTION:
-                SHEET_ACTION[key] = make_sheet_action(act, SHEET_RANGE)
-            sheet, src_start, span = SHEET_ACTION[key]
-            act = sheet
-            frame = int(round((frame - src_start) / span * SHEET_RANGE))
-        # The action is NEVER bound to the rig. On some of these rigs the
-        # action's own evaluation collapses the skinned mesh to a point,
-        # so the pose is driven from the curves by hand instead and the
-        # scene stays on a frame where nothing is bound.
-        arm.animation_data.action = None
-        pose_from_curves(arm, act, frame)
-        bpy.context.scene.frame_set(1)
-        bpy.context.view_layer.update()
-        return True
-    return False
+        name = job.get('name') or Path(job.get('model', 'model')).stem
+        action = job.get('action', '')
+        folder = outroot / safe_name(name) / (safe_name(action) if action else '')
+        for key in ('model', 'action', 'frames', 'angles', 'res',
+                    'px_per_m', 'ground_px', 'elev', 'compress',
+                    'length', 'anchor', 'spin', 'spin_angle',
+                    'spin_axis', 'fps', 'in_place'):
+            if key in job:
+                setattr(args, key, job[key])
+        args.out = str(folder)
+        args.prefix = job.get('prefix', safe_name(name).lower())
+        args.action = action
+        args.batch = ''
+        print('BATCH JOB:', name, action, '->', folder, flush=True)
+        render_sheet(args)
+        done += 1
+    print('BATCH DONE:', done, 'jobs ->', outroot)
+    return 0
+
+
+VIEWER_TEMPLATE = HERE / 'sprite_viewer.html'
+
+
+def write_viewer(outdir, manifest):
+    """Write the player next to the frames.
+
+    The player is one HTML file. Open it and the sheet plays: the
+    animation runs and the turntable turns, the way the game plays it.
+    No install, no server - it works on any computer with a browser.
+    """
+    data = {
+        'model': manifest.get('model', ''),
+        'angles': manifest.get('angles', 0),
+        'fps': manifest.get('fps', 12),
+        'actions': manifest.get('actions', []),
+    }
+    try:
+        html = VIEWER_TEMPLATE.read_text(encoding='utf-8')
+    except OSError:
+        print('no viewer template next to the script')
+        return ''
+    html = html.replace('/*__DATA__*/ null', json.dumps(data))
+    out = Path(outdir) / 'sprite_viewer.html'
+    out.write_text(html, encoding='utf-8')
+    print('VIEWER WRITTEN:', out)
+    return str(out)
 
 
 def set_engine(scene):
@@ -446,6 +660,26 @@ def main():
               "--out ./sheet --angles 64")
         return 1
 
+    return render_sheet(args)
+
+
+def render_sheet(args):
+    """Render the sheet. args carries the switches.
+
+    Split out of main() so the window UI and the command line use exactly
+    the same engine. args only has to have the attributes on it.
+    """
+    model = Path(args.model)
+    if not model.is_file():
+        raise SystemExit("no such model: " + str(model))
+    if model.suffix.lower() not in MODEL_SUFFIXES:
+        raise SystemExit("unsupported model type: " + model.suffix +
+                         " (use .blend, .fbx, .glb or .gltf)")
+    # A JOB LIST shoots many models in one run. This is the shape the
+    # Blaster Master build uses: a name, a model, an action, the frames.
+    if getattr(args, 'batch', ''):
+        return run_batch(args)
+
     outdir = Path(args.out)
     outdir.mkdir(parents=True, exist_ok=True)
     prefix = args.prefix
@@ -456,39 +690,33 @@ def main():
     elev = float(args.elev)
     global SHEET_RANGE
     SHEET_RANGE = float(args.compress)
+    # the cached copies of the actions belong to the old range
+    SHEET_ACTION.clear()
 
     load_model(model)
     ensure_materials()
-
-    # --- drive the rig to a named action -----------------------------------
-    act_name = args.action
-    # frames can be a list: for a walk sheet you want several frames of the
-    # same action, one per animation frame, for every angle
-    frame_list = [int(x) for x in
-                  args.frames.replace(",", ":").split(":") if x]
-    arms = [o for o in bpy.data.objects if o.type == 'ARMATURE']
-    if act_name:
-        if not arms:
-            raise SystemExit("no armature in " + str(model))
-        if not set_pose(arms[0], act_name, frame_list[0]):
-            raise SystemExit("action not found: " + act_name)
-        print("posed:", act_name, "frames", frame_list)
-
-    # A walk cycle that also moves the root would walk the model out of the
-    # frame, so the root is pinned to where it stands on the first frame and
-    # the legs do the moving.
-    root_name = ""
-    root_loc = None
-    if args.in_place and arms and len(arms[0].data.bones):
-        root_name = arms[0].data.bones[0].name
-        set_pose(arms[0], act_name, frame_list[0])
-        bpy.context.view_layer.update()
-        root_loc = tuple(arms[0].pose.bones[root_name].location)
 
     # hidden reference meshes must not pollute the framing
     for o in bpy.data.objects:
         if o.type == 'MESH' and o.hide_render:
             o.hide_viewport = True
+
+    # --- what animations does this model actually have? --------------------
+    # The window lists these, so the person can pick the animation they
+    # want - walk, attack, whatever the model carries.
+    arms = [o for o in bpy.data.objects if o.type == 'ARMATURE']
+    found = action_info()
+    if getattr(args, 'list_actions', False):
+        print('ACTIONS_JSON:' + json.dumps(found))
+        for a in found:
+            print('  %-26s frames %-12s bones %d'
+                  % (a['name'], '%g-%g' % (a['start'], a['end']),
+                     a['bones']))
+        print('ACTION LIST DONE:', len(found), 'actions ->', model.name)
+        return 0
+    if found:
+        print('model has %d action(s): %s'
+              % (len(found), ', '.join(a['name'] for a in found)))
 
     def roots():
         return [o for o in bpy.data.objects
@@ -507,6 +735,10 @@ def main():
         return mn, mx
 
     # --- scale to the target size (only the roots; children follow) --------
+    # The size is measured on the REST pose, before any animation is
+    # applied. Every action of a model then shares ONE world scale and ONE
+    # ground line, which is the point of the contract: the game can put a
+    # walking model and an attacking model on the same floor.
     target_len = float(args.length)
     if target_len > 0.0:
         mn, mx = measure()
@@ -525,6 +757,32 @@ def main():
         for o in roots():
             o.location.z -= mn.z
     bpy.context.view_layer.update()
+
+    # --- does the whole model fit the frame? ------------------------------
+    # The frame is res/px_per_m metres across, and the feet sit
+    # ground_px above the bottom of it. A model taller than that is cut
+    # off: the head goes missing. --fit pulls the camera back, which
+    # changes px_per_m and NOT the size of the model, so the ground line
+    # stays exactly where it was and the model keeps its real size.
+    mn, mx = measure()
+    height = mx.z - mn.z
+    half = max(abs(mn.x), abs(mx.x), abs(mn.y), abs(mx.y))
+    if anchor == "floor":
+        visible_h = (res - ground_px) / px_per_m
+    else:
+        visible_h = res / px_per_m
+    visible_w = res / px_per_m
+    need = max(height / max(visible_h, 1e-6),
+               (2.0 * half) / max(visible_w, 1e-6))
+    if need > 1.001:
+        if getattr(args, 'fit', False):
+            px_per_m = px_per_m / need
+            print('FIT: the model is %.3f m tall - px per metre lowered to %.2f'
+                  % (height, px_per_m))
+        else:
+            print('WARNING: the model is %.3f m tall but the frame only '
+                  'shows %.3f m. The head is cut off.' % (height, visible_h))
+            print('WARNING: use --fit, or a smaller --px-per-m.')
 
     flatten_to_albedo()
 
@@ -603,23 +861,91 @@ def main():
         print("SPIN DONE:", spin, "frames ->", outdir)
         return 0
 
-    for i in range(angles):
-        aim(2 * math.pi * i / angles)
-        for f in frame_list:
-            if act_name:
-                set_pose(arms[0], act_name, f)
-                if root_name and root_loc is not None:
-                    arms[0].pose.bones[root_name].location = root_loc
-                    bpy.context.view_layer.update()
-            if len(frame_list) > 1:
-                sc.render.filepath = str(outdir / ("%s_a%02d_f%02d" % (prefix, i, f)))
-            else:
-                sc.render.filepath = str(outdir / ("%s_a%02d" % (prefix, i)))
-            bpy.ops.render.render(write_still=True)
-        print("  angle %2d  frames %s" % (i, frame_list))
+    # --- which animations are we shooting? ---------------------------------
+    act_name = args.action
+    if act_name == 'all':
+        # Only the clips that drive the rig. A rig file also carries mesh
+        # actions (an eye effect, a shape key) that pose nothing.
+        rig_acts = [a['name'] for a in found if a['bones'] > 0]
+        if not rig_acts:
+            raise SystemExit('no rig animations in ' + str(model))
+        todo = rig_acts
+    elif act_name:
+        todo = [act_name]
+    else:
+        todo = ['']                 # the rest pose
 
-    print("SHEET DONE:", angles, "frames ->", outdir)
-    print("engine:", engine, "| res:", res, "| px per metre:", px_per_m)
+    manifest = {
+        'tool': 'sprite_turntable',
+        'version': VERSION,
+        'model': model.name,
+        'angles': angles,
+        'res': res,
+        'px_per_m': px_per_m,
+        'ground_px': ground_px,
+        'fps': int(getattr(args, 'fps', 12) or 12),
+        'prefix': prefix,
+        'grid': 'one row per angle, each row is the animation frames',
+        'actions': [],
+    }
+    total = 0
+    for name in todo:
+        folder = action_folder(name, arms[0] if arms else None)
+        sub = outdir if len(todo) <= 1 else outdir / folder
+        sub.mkdir(parents=True, exist_ok=True)
+        frame_list = frames_for(name, args, found) if name else [1]
+        root_name = ''
+        root_loc = None
+        if name:
+            if not arms:
+                raise SystemExit('no armature in ' + str(model))
+            if not set_pose(arms[0], name, frame_list[0]):
+                raise SystemExit('action not found: ' + name)
+            print('posed:', name, 'frames', frame_list)
+            # A walk cycle that also moves the root would walk the model
+            # out of the frame, so the root is pinned to where it stands
+            # on the first frame and the legs do the moving.
+            if args.in_place and len(arms[0].data.bones):
+                root_name = arms[0].data.bones[0].name
+                bpy.context.view_layer.update()
+                root_loc = tuple(arms[0].pose.bones[root_name].location)
+        for i in range(angles):
+            aim(2 * math.pi * i / angles)
+            for f in frame_list:
+                if name:
+                    set_pose(arms[0], name, f)
+                    if root_name and root_loc is not None:
+                        arms[0].pose.bones[root_name].location = root_loc
+                        bpy.context.view_layer.update()
+                if len(frame_list) > 1:
+                    sc.render.filepath = str(
+                        sub / ('%s_a%02d_f%02d' % (prefix, i, f)))
+                else:
+                    sc.render.filepath = str(sub / ('%s_a%02d' % (prefix, i)))
+                bpy.ops.render.render(write_still=True)
+            print('  angle %2d  frames %s' % (i, frame_list))
+        total += angles * len(frame_list)
+        manifest['actions'].append({
+            'name': name if name else 'rest',
+            'folder': '' if len(todo) <= 1 else folder,
+            'prefix': prefix,
+            'angles': angles,
+            'frames': len(frame_list),
+            'frame_numbers': frame_list,
+            'pattern': (('%s_a%%02d_f%%02d.png' % prefix)
+                        if len(frame_list) > 1 else ('%s_a%%02d.png' % prefix)),
+        })
+        print('ACTION DONE:', name if name else 'rest pose', '->', sub)
+
+    mpath = Path(args.manifest) if getattr(args, 'manifest', '') \
+        else outdir / 'sprite_manifest.json'
+    mpath.parent.mkdir(parents=True, exist_ok=True)
+    mpath.write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+    print('MANIFEST:', mpath)
+    write_viewer(outdir, manifest)
+
+    print('SHEET DONE:', total, 'frames ->', outdir)
+    print('engine:', engine, '| res:', res, '| px per metre:', px_per_m)
     return 0
 
 

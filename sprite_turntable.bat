@@ -8,6 +8,11 @@ REM Needs Blender (free). If Blender is somewhere unusual, set BLENDER_EXE
 REM to the full path of blender.exe before running this.
 
 setlocal
+REM No arguments means: open the window. One button, no typing.
+if "%~1"=="" (
+  powershell -NoProfile -ExecutionPolicy Bypass -STA -File "%~dp0sprite_turntable_gui.ps1"
+  exit /b %ERRORLEVEL%
+)
 set "HERE=%~dp0"
 if not "%BLENDER_EXE%"=="" set "BT_BLENDER=%BLENDER_EXE%"
 if not defined BT_BLENDER call :find_blender

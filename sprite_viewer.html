@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sprite Turntable - player</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #0b0d14; color: #dfe3ee; font-family: "Segoe UI", Arial, sans-serif; }
+  #bar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; padding: 10px 16px; background: #12151f; border-bottom: 1px solid #232837; }
+  #bar h1 { font-size: 17px; margin: 0 8px 0 0; }
+  #bar .sub { font-size: 12px; color: #8b96b4; margin-right: auto; }
+  button { background: #1d2334; color: #cfe3ff; border: 1px solid #2e3850; border-radius: 6px; padding: 7px 14px; cursor: pointer; font-size: 13px; }
+  button:hover { background: #273050; }
+  button.active { background: #2f4a8a; border-color: #4f74c4; }
+  select { background: #1d2334; color: #cfe3ff; border: 1px solid #2e3850; border-radius: 6px; padding: 6px 10px; font-size: 13px; }
+  #stage { height: 56vh; min-height: 330px; border-bottom: 1px solid #232837; overflow: hidden; }
+  #checker { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center;
+    background-image: linear-gradient(45deg, #15181f 25%, transparent 25%), linear-gradient(-45deg, #15181f 25%, transparent 25%),
+      linear-gradient(45deg, transparent 75%, #15181f 75%), linear-gradient(-45deg, transparent 75%, #15181f 75%);
+    background-size: 32px 32px; background-position: 0 0, 0 16px, 16px -16px, -16px 0; background-color: #0d1017; }
+  #sprite { max-width: 96%; max-height: 96%; }
+  #controls { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; padding: 12px 16px; background: #12151f; border-bottom: 1px solid #232837; }
+  #controls label { font-size: 12px; color: #8b96b4; }
+  input[type="range"] { width: 190px; accent-color: #00ff88; }
+  .val { font-size: 12px; color: #00ff88; font-weight: bold; min-width: 60px; display: inline-block; }
+  #strip { display: flex; gap: 8px; padding: 14px 16px; overflow-x: auto; }
+  #strip img { height: 84px; width: auto; background: #12151f; border: 1px solid #232837; border-radius: 4px; cursor: pointer; }
+  #strip img.on { border-color: #00ff88; box-shadow: 0 0 14px rgba(0,255,136,0.25); }
+  #foot { padding: 0 16px 18px; font-size: 12px; color: #66718f; text-align: center; line-height: 1.6; }
+  #err { padding: 24px; color: #ffb3b3; font-family: Consolas, monospace; font-size: 13px; }
+</style>
+</head>
+<body>
+<div id="bar">
+  <h1>Sprite Turntable</h1>
+  <span class="sub" id="sub"></span>
+  <select id="action"></select>
+  <button id="play">PAUSE</button>
+  <button id="spin" class="active">SPIN ON</button>
+</div>
+<div id="stage"><div id="checker"><img id="sprite" alt="sprite frame"></div></div>
+<div id="controls">
+  <label>Animation</label>
+  <input type="range" id="frame" min="0" max="0" value="0">
+  <span class="val" id="frameVal">0 / 0</span>
+  <label>Turntable</label>
+  <input type="range" id="angle" min="0" max="0" value="0">
+  <span class="val" id="angleVal">0 / 0</span>
+  <label>Speed</label>
+  <input type="range" id="fps" min="2" max="30" value="12">
+  <span class="val" id="fpsVal">12 fps</span>
+</div>
+<div id="strip"></div>
+<div id="foot">Space plays and pauses. Left and right step the animation. Up and down turn the model. Every frame is a flat PNG - your game does the lighting.</div>
+<div id="err"></div>
+<script>
+const DATA = /*__DATA__*/ null;
+
+const sprite = document.getElementById("sprite");
+const strip = document.getElementById("strip");
+const frameRange = document.getElementById("frame");
+const angleRange = document.getElementById("angle");
+const fpsRange = document.getElementById("fps");
+const frameVal = document.getElementById("frameVal");
+const angleVal = document.getElementById("angleVal");
+const fpsVal = document.getElementById("fpsVal");
+const actionSelect = document.getElementById("action");
+const playBtn = document.getElementById("play");
+const spinBtn = document.getElementById("spin");
+const sub = document.getElementById("sub");
+
+const state = { action: 0, frame: 0, angle: 0, playing: true, spin: true, fps: 12 };
+const cache = new Map();
+let stripKey = "";
+let last = 0;
+let clock = 0;
+
+function pad(n) { return String(n).padStart(2, "0"); }
+function act() { return (DATA && DATA.actions && DATA.actions[state.action]) ? DATA.actions[state.action] : null; }
+
+function fileFor(a, angle, frameNo) {
+  const folder = a.folder ? a.folder + "/" : "";
+  const tail = a.frames > 1
+    ? a.prefix + "_a" + pad(angle) + "_f" + pad(frameNo) + ".png"
+    : a.prefix + "_a" + pad(angle) + ".png";
+  return folder + tail;
+}
+
+function preload(path) {
+  if (cache.has(path)) { return; }
+  const img = new Image();
+  img.src = path;
+  cache.set(path, img);
+  if (cache.size > 90) { cache.delete(cache.keys().next().value); }
+}
+
+function buildStrip(a) {
+  const key = state.action + "/" + state.angle;
+  if (key === stripKey) { return; }
+  stripKey = key;
+  strip.textContent = "";
+  const nums = a.frame_numbers || [];
+  for (let i = 0; i < a.frames; i++) {
+    const no = nums.length ? nums[i] : 0;
+    const img = document.createElement("img");
+    img.src = fileFor(a, state.angle, no);
+    img.title = "frame " + (i + 1);
+    if (i === state.frame) { img.className = "on"; }
+    img.onclick = function () { state.frame = i; draw(a); };
+    strip.appendChild(img);
+  }
+}
+
+function draw(a) {
+  const nums = a.frame_numbers || [];
+  const frameNo = nums.length ? nums[state.frame] : 0;
+  const path = fileFor(a, state.angle, frameNo);
+  sprite.src = path;
+  preload(path);
+  preload(fileFor(a, state.angle, nums.length ? nums[(state.frame + 1) % a.frames] : 0));
+  frameRange.max = Math.max(0, a.frames - 1);
+  frameRange.value = state.frame;
+  frameVal.textContent = (state.frame + 1) + " / " + a.frames;
+  angleRange.max = Math.max(0, a.angles - 1);
+  angleRange.value = state.angle;
+  angleVal.textContent = (state.angle + 1) + " / " + a.angles;
+  buildStrip(a);
+}
+
+function selectAction(a) {
+  state.frame = 0;
+  state.angle = 0;
+  stripKey = "";
+  if (a) { draw(a); }
+}
+
+function tick(now) {
+  if (!last) { last = now; }
+  const dt = Math.min((now - last) / 1000, 0.25);
+  last = now;
+  const a = act();
+  if (a && state.playing) {
+    if (state.spin && a.angles > 1) {
+      state.angle = (state.angle + dt * (a.angles / 4)) % a.angles;
+      state.angle = Math.floor(state.angle);
+    }
+    clock += dt;
+    const step = 1 / state.fps;
+    let moved = false;
+    while (clock >= step) {
+      clock -= step;
+      state.frame = (state.frame + 1) % a.frames;
+      moved = true;
+    }
+    if (moved || state.spin) { draw(a); }
+  }
+  requestAnimationFrame(tick);
+}
+
+actionSelect.onchange = function () {
+  state.action = parseInt(actionSelect.value, 10) || 0;
+  selectAction(act());
+};
+
+playBtn.onclick = function () {
+  state.playing = !state.playing;
+  playBtn.textContent = state.playing ? "PAUSE" : "PLAY";
+  playBtn.classList.toggle("active", !state.playing);
+};
+
+spinBtn.onclick = function () {
+  state.spin = !state.spin;
+  spinBtn.textContent = state.spin ? "SPIN ON" : "SPIN OFF";
+  spinBtn.classList.toggle("active", state.spin);
+};
+
+frameRange.oninput = function () {
+  state.frame = parseInt(frameRange.value, 10) || 0;
+  const a = act();
+  if (a) { draw(a); }
+};
+
+angleRange.oninput = function () {
+  state.angle = parseInt(angleRange.value, 10) || 0;
+  state.spin = false;
+  spinBtn.textContent = "SPIN OFF";
+  spinBtn.classList.remove("active");
+  const a = act();
+  if (a) { draw(a); }
+};
+
+fpsRange.oninput = function () {
+  state.fps = parseInt(fpsRange.value, 10) || 12;
+  fpsVal.textContent = state.fps + " fps";
+};
+
+document.onkeydown = function (ev) {
+  const a = act();
+  if (!a) { return; }
+  if (ev.code === "Space") {
+    ev.preventDefault();
+    playBtn.click();
+  } else if (ev.code === "ArrowRight") {
+    state.frame = (state.frame + 1) % a.frames; draw(a);
+  } else if (ev.code === "ArrowLeft") {
+    state.frame = (state.frame - 1 + a.frames) % a.frames; draw(a);
+  } else if (ev.code === "ArrowUp") {
+    state.angle = (state.angle + 1) % a.angles; draw(a);
+  } else if (ev.code === "ArrowDown") {
+    state.angle = (state.angle - 1 + a.angles) % a.angles; draw(a);
+  }
+};
+
+if (!DATA || !DATA.actions || !DATA.actions.length) {
+  document.getElementById("err").textContent = "No sheet data in this file. Run the sprite turntable first.";
+} else {
+  for (let i = 0; i < DATA.actions.length; i++) {
+    const opt = document.createElement("option");
+    opt.value = String(i);
+    opt.textContent = DATA.actions[i].name;
+    actionSelect.appendChild(opt);
+  }
+  state.fps = DATA.fps || 12;
+  fpsRange.value = state.fps;
+  fpsVal.textContent = state.fps + " fps";
+  const a = act();
+  sub.textContent = (DATA.model || "model") + " - " + DATA.angles + " angles - " + a.frames + " frames";
+  selectAction(a);
+  requestAnimationFrame(tick);
+}
+</script>
+</body>
+</html>

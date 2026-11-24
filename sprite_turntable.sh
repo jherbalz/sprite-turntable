@@ -24,5 +24,9 @@ if [ -z "$BLENDER" ]; then
   echo "or set BLENDER_EXE to the full path of the blender binary." >&2
   exit 1
 fi
+if [ -z "$1" ]; then
+  echo "Opening Blender with the Sprite panel..."
+  exec "$BLENDER" --python "$HERE/sprite_turntable_ui.py"
+fi
 echo "Using Blender: $BLENDER"
 exec "$BLENDER" --background --factory-startup --python "$HERE/sprite_turntable.py" -- "$@"
